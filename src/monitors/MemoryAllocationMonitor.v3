@@ -12,7 +12,7 @@ var next_id = 1u64;
 var alloc_table = HashMap<u64, AllocCallResult>.new(int.!<u64>, u64.==);
 var free_table = HashMap<u64, FreeCallResult>.new(int.!<u64>, u64.==);
 var addr_to_id_table = HashMap<u32, u64>.new(int.!<u32>, u32.==);
-var current_free_id = 0u64;
+var last_free_id = 0u64;
 
 class MemoryAllocationMonitor extends Monitor {
 
@@ -82,15 +82,6 @@ class MemoryAllocationMonitor extends Monitor {
 
     private def instrumentFree(mm: ModuleInstrumenter, func: FuncDecl) {
         Instrumentation.insertLocalProbe(mm.module, func.func_index, 0, FreeEnterProbe.new(mm.module, func));
-        for (bi = BytecodeIterator.new().reset(func); bi.more(); bi.next()) {
-            match (bi.current()) {
-                RETURN, RETURN_CALL, RETURN_CALL_INDIRECT, RETURN_CALL_REF => {
-                    Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, FreeExitProbe.new());
-                }
-                _ => ;
-            }
-        }
-        Instrumentation.insertLocalProbe(mm.module, func.func_index, func.cur_bytecode.length - 1, FreeExitProbe.new());
     }
 }
 
@@ -151,7 +142,6 @@ private class FreeEnterProbe(module: Module, func: FuncDecl) extends Probe {
         if (addr_to_id_table.has(addr)) {
             id = addr_to_id_table[addr];
         }
-        current_free_id = id;
 
         var caller_pc = 0;
         var caller_func: FuncDecl;
@@ -166,16 +156,14 @@ private class FreeEnterProbe(module: Module, func: FuncDecl) extends Probe {
         var ctx = CallContext(module, caller_func, caller_pc);
         free_table[id] = FreeCallResult(ctx, addr);
 
-        return Resumption.Continue;
-    }
-}
+        if (last_free_id == id) {
+            // double free
+            output_free_record(ctx, addr, 0u64);
+        } else {
+            output_free_record(ctx, addr, id);
+        }
 
-// we make sure that the output is called after the free function completes
-private class FreeExitProbe extends Probe {
-    def fire(dynamicLoc: DynamicLoc) -> Resumption {
-        var id = current_free_id;
-        var free_result = free_table[id];
-        output_free_record(free_result.ctx, free_result.addr, id);
+        last_free_id = id;
         return Resumption.Continue;
     }
 }
