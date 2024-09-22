@@ -1,0 +1,323 @@
+// Copyright 2024 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def monitor_ = MonitorRegistry.add(
+    "paths", "Profiles all unique paths through the program.",
+    PathProfilingMonitor.new());
+
+type PathEntry(pc: int);
+type Path(entries: Vector<PathEntry>, count: u64);
+type PathTable(func_index_to_paths: HashMap<int, Vector<Path>>);
+
+var path_table = PathTable(HashMap.new(int.!<int>, int.==));
+var loop_pcs: HashMap<int, Vector<int>> = HashMap.new(int.!<int>, int.==);
+
+var last_is_branch = false;
+
+var current_func: FuncDecl;
+var current_path: HashMap<int, ArrayStack<Vector<PathEntry>>> = HashMap.new(int.!<int>, int.==);
+
+// Path comparator for sorting
+// - longer paths are greater
+// - paths with more occurrences are greater
+// - lexicographic order of the path entries (small to large)
+def compare(lhs: Path, rhs: Path) -> bool {
+    if (lhs.entries.length != rhs.entries.length) {
+        return lhs.entries.length > rhs.entries.length;
+    }
+
+    if (lhs.count != rhs.count) {
+        return lhs.count > rhs.count;
+    }
+
+    // lexicographic order of the path entries
+    for (i < lhs.entries.length) {
+        if (lhs.entries[i].pc != rhs.entries[i].pc) {
+            return lhs.entries[i].pc < rhs.entries[i].pc;
+        }
+    }
+
+    // unreachable
+    return false;
+}
+
+class PathProfilingMonitor extends Monitor {
+    var profiled_module: Module;
+
+    def onParse(module: Module) {
+        profiled_module = module;
+
+        var mm = ModuleInstrumenter.new(module);
+
+        var global_probe = GlobalPathManagerProbe.new();
+        Instrumentation.insertGlobalProbe(global_probe);
+
+        for (i < module.functions.length) {
+            loop_pcs[i] = Vector<int>.new();
+        }
+
+        mm.forEachFunc(instrumentFunction);
+    }
+
+    def onFinish(i: Instance, r: Result) {
+        var func_indices = Lists.toArray(Maps.keyList(path_table.func_index_to_paths));
+        func_indices = Arrays.sort(func_indices, 0, func_indices.length, int.<);
+
+        for (i < func_indices.length) {
+            var func_index = func_indices[i];
+            var paths = path_table.func_index_to_paths[func_index];
+            if (paths == null) {
+                continue;
+            }
+            output_func_header(profiled_module, profiled_module.functions[func_index]);
+            var paths_arr = paths.extract();
+            paths_arr = Arrays.sort(paths_arr, 0, paths_arr.length, compare);
+            for (j < paths_arr.length) {
+                var path = paths_arr[j];
+                if (path.entries.length == 0) {
+                    continue;
+                }
+                output_path(path.entries.extract(), path.count);
+            }
+        }
+    }
+
+    def instrumentFunction(mm: ModuleInstrumenter, func: FuncDecl) {
+        var enter_probe = EnterProbe.new(func);
+        Instrumentation.insertLocalProbe(mm.module, func.func_index, 0, enter_probe);
+        for (bi = BytecodeIterator.new().reset(func); bi.more(); bi.next()) {
+            match (bi.current()) {
+                THROW, RETHROW, THROW_REF, BR, BR_TABLE, DELEGATE => {
+                    var branch_probe = BranchProbe.new();
+                    Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, branch_probe);
+                }
+                BR_IF => {
+                    var branch_if_probe = BranchIfProbe.new();
+                    Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, branch_if_probe);
+                }
+                LOOP => {
+                    var loop_probe = LoopProbe.new(func);
+                    Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, loop_probe);
+                    loop_pcs[func.func_index].put(bi.pc);
+                }
+                RETURN => {
+                    var return_probe = ReturnProbe.new(func);
+                    Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, return_probe);
+                }
+                END => {
+                    if (bi.pc + 1 < bi.func.cur_bytecode.length) {
+                        continue;
+                    }
+                    var return_probe = ReturnProbe.new(func);
+                    Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, return_probe);
+                }
+                _ => ;
+            }
+        }
+    }
+}
+
+private class EnterProbe(func: FuncDecl) extends Probe {
+    def fire(dynamicLoc: DynamicLoc) -> Resumption {
+        last_is_branch = false;
+
+        current_func = func;
+
+        if (path_table.func_index_to_paths[func.func_index] == null) {
+            path_table.func_index_to_paths[func.func_index] = Vector<Path>.new();
+        }
+
+        if (current_path[func.func_index] == null) {
+            current_path[func.func_index] = ArrayStack<Vector<PathEntry>>.new();
+        }
+        var new_path = Vectors.of1(PathEntry(dynamicLoc.pc));
+        current_path[func.func_index].push(new_path);
+
+        return Resumption.Continue;
+    }
+}
+
+private class LoopProbe(func: FuncDecl) extends Probe {
+    def fire(dynamicLoc: DynamicLoc) -> Resumption {
+        // end the path
+        return_callback(func, dynamicLoc);
+
+        // start a new path from the loop
+        if (current_path[func.func_index] == null) {
+            current_path[func.func_index] = ArrayStack<Vector<PathEntry>>.new();
+        }
+
+        var new_path = Vectors.of1(PathEntry(dynamicLoc.pc));
+        current_path[func.func_index].push(new_path);
+
+        return Resumption.Continue;
+    }
+}
+
+private class ReturnProbe(func: FuncDecl) extends Probe {
+    def fire(dynamicLoc: DynamicLoc) -> Resumption {
+        return return_callback(func, dynamicLoc);
+    }
+}
+
+private class BranchProbe extends Probe {
+    def fire(dynamicLoc: DynamicLoc) -> Resumption {
+        last_is_branch = true;
+        return Resumption.Continue;
+   }
+}
+
+private class BranchIfProbe extends Probe {
+    def fire(dynamicLoc: DynamicLoc) -> Resumption {
+        // check the top of the stack
+        var top = dynamicLoc.frame.getFrameAccessor().getOperand(0);
+        var cond = Values.v_i(top);
+        if (cond != 0) {
+            last_is_branch = true;
+        }
+
+        return Resumption.Continue;
+    }
+}
+
+private class GlobalPathManagerProbe extends Probe {
+    def fire(dynamicLoc: DynamicLoc) -> Resumption {
+        if (last_is_branch) {
+            last_is_branch = false;
+
+            // if this is a loop, we don't want to add the entry to the path
+            // because we are going to end it in the loop probe and start a new path
+            // there
+            var cur_pc = dynamicLoc.pc;
+            var loop_pcs = loop_pcs[current_func.func_index];
+            for (i < loop_pcs.length) {
+                var loop_pc = loop_pcs[i];
+                if (loop_pc == cur_pc) {
+                    return Resumption.Continue;
+                }
+            }
+
+            var func_index = current_func.func_index;
+            var func_path = current_path[func_index].pop();
+            if (func_path == null) {
+                func_path = Vector<PathEntry>.new();
+            }
+            func_path.put(PathEntry(dynamicLoc.pc));
+            current_path[func_index].push(func_path);
+        }
+
+        return Resumption.Continue;
+    }
+}
+
+def return_callback(func: FuncDecl, dynamicLoc: DynamicLoc) -> Resumption {
+    // see if the path is already in the table
+    var paths = path_table.func_index_to_paths[func.func_index];
+    var is_new_path = true;
+    var func_path = current_path[func.func_index].peek();
+
+    // deduplication
+    for (i < paths.length) {
+        var path = paths[i];
+        if (path.entries.length != func_path.length) {
+            continue;
+        }
+
+        var entries = path.entries;
+        var is_same = true;
+        for (i < entries.length) {
+            if (entries[i].pc != func_path[i].pc) {
+                is_same = false;
+                break;
+            }
+        }
+
+        if (is_same) {
+            is_new_path = false;
+            var new_path = Path(path.entries, path.count + 1);
+            path_table.func_index_to_paths[func.func_index][i] = new_path;
+        }
+    }
+
+    // if not, add it to the table
+    if (is_new_path) {
+        path_table.func_index_to_paths[func.func_index].put(Path(func_path, 1));
+    }
+
+    // reset the current path
+    current_path[func.func_index].pop();
+
+    last_is_branch = false;
+
+    return Resumption.Continue;
+}
+
+
+
+/***** OUTPUT FORMATTING HELPER METHODS (Do not modify) *****/
+/*
+ * ***Output Format for Grading:***
+ *
+ * 1. **Function Header Output:**
+ *    - Use the helper method `output_func_header()` to print the header for each function.
+ *    - The **function headers must be printed in increasing order of function index** (e.g., Func0, Func1, Func2, ...).
+ *    - This method should be invoked before printing any paths for the function.
+ *
+ * 2. **Path Output:**
+ *    - Use the helper method `output_path()` to print each path as a list of PathEntries, representing the order in which the paths were visited.
+ *    - The **paths for each function must be printed in decreasing order of their length** (i.e., longest path first).
+ *
+ * ***Post-Execution Output:***
+ *    - After the program execution completes, ensure that **each function's information is printed in increasing order of function index**.
+ *    - After printing each function header, **all paths associated with that function must be output in decreasing order of their path length**.
+ *
+ * ***Important Notes:***
+ * - The **correct order of function headers and paths** is essential for grading.
+ * - The paths **must be ordered from longest to shortest** for each function.
+ * - Do not report unvisited functions or paths.
+ * - Remember that returning from a function and the 'loop' bytecode terminate the path. Entering a new function initiates a new path
+ * - **Do not invoke any other output functions** besides the methods specified above.
+ * - **Double-check your output** to ensure it meets the required format, as incorrect output will result in lost points.
+ */
+
+
+// Method to output function header
+def output_func_header(module: Module, func: FuncDecl) {
+    Trace.OUT.beginColor(Color.FUNC)
+        .put1("func %q:", func.render(module.names, _))
+        .endColors().ln();
+
+}
+
+// Method to output a single path
+def output_path(path: Array<PathEntry>, count: u64) {
+    if (path == null) {
+        Trace.OUT.beginColor(Color.HIGH).puts("Null Path").ln();
+        return;
+    }
+    if (path.length == 0) {
+        Trace.OUT.beginColor(Color.HIGH).puts("Unknown Empty Path").ln();
+        return;
+    }
+    for (i < path.length) {
+        Trace.OUT.beginColor(Color.SOURCE)
+            .mark()
+            .put1("+%d", path[i].pc)
+            .rjustify_mark(3)
+            .endColors();
+        Trace.OUT.beginColor(Color.FUNC)
+            .puts(" --> ")
+            .endColors();
+    }
+    Trace.OUT.beginColor(Color.COUNT)
+        .puts("|EoF| ");
+    Trace.OUT.beginColor(Color.SUCCESS)
+        .mark()
+        .put1("%d", count)
+        .rjustify_mark(6)
+        .endColors()
+        .ln();
+}
+/******************/
+
+
