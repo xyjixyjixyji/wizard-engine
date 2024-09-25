@@ -13,6 +13,7 @@ var path_table = PathTable(HashMap.new(int.!<int>, int.==));
 var loop_pcs: HashMap<int, Vector<int>> = HashMap.new(int.!<int>, int.==);
 
 var last_is_branch = false;
+var last_if_runned = false;
 
 var current_func: FuncDecl;
 var current_path: HashMap<int, ArrayStack<Vector<PathEntry>>> = HashMap.new(int.!<int>, int.==);
@@ -91,6 +92,14 @@ class PathProfilingMonitor extends Monitor {
                     var branch_probe = BranchProbe.new();
                     Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, branch_probe);
                 }
+                IF => {
+                    var if_probe = IfProbe.new();
+                    Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, if_probe);
+                }
+                ELSE => {
+                    var else_probe = ElseProbe.new();
+                    Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, else_probe);
+                }
                 BR_IF => {
                     var branch_if_probe = BranchIfProbe.new();
                     Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, branch_if_probe);
@@ -165,6 +174,29 @@ private class BranchProbe extends Probe {
         last_is_branch = true;
         return Resumption.Continue;
    }
+}
+
+private class IfProbe extends Probe {
+    def fire(dynamicLoc: DynamicLoc) -> Resumption {
+        last_is_branch = true;
+        var top = dynamicLoc.frame.getFrameAccessor().getOperand(0);
+        var cond = Values.v_i(top);
+
+        last_if_runned = cond != 0;
+
+        return Resumption.Continue;
+   }
+}
+
+private class ElseProbe extends Probe {
+    // branch if the if was runned....
+    def fire(dynamicLoc: DynamicLoc) -> Resumption {
+        if (last_if_runned) {
+            last_is_branch = true;
+        }
+        last_if_runned = false;
+        return Resumption.Continue;
+    }
 }
 
 private class BranchIfProbe extends Probe {
