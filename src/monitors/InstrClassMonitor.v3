@@ -11,6 +11,9 @@ class InstrClassMonitor extends Monitor {
 	def it = BytecodeIterator.new();
 
 	def onParse(m: Module) {
+		for (i = 0; i < 9; i++) {
+			entries.set(i, InstrClassEntry(indexToInstrClass(i), 0, CountProbe.new()));
+		}
 		ModuleInstrumenter.new(m).forEachFunc(instrument);
 	}
 
@@ -26,14 +29,11 @@ class InstrClassMonitor extends Monitor {
 			var probe: CountProbe;
 			var iclass = classify(op);
 			var index = instrClassToIndex(iclass);
-			if (index >= entries.length) {
-				probe = CountProbe.new();
-				entries.set(op.tag, InstrClassEntry(iclass, 1, probe));
-			} else {
-				var e = entries[index];
-				probe = if(e.count != null, e.count, CountProbe.new());
-				entries[index] = InstrClassEntry(iclass, e.static_count + 1u, probe);
-			}
+
+			var e = entries[index];
+			probe = if(e.count != null, e.count, CountProbe.new());
+			entries[index] = InstrClassEntry(iclass, e.static_count + 1u, probe);
+
 			Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, probe);
 		}
 	}
@@ -74,6 +74,21 @@ def instrClassToIndex(c: InstrClass) -> int {
 		SIMD_ARITH => return 7;
 		REF => return 8;
 	}
+}
+def indexToInstrClass(i: int) -> InstrClass {
+	match (i) {
+		0 => return InstrClass.NOP;
+		1 => return InstrClass.CONTROL;
+		2 => return InstrClass.DATA;
+		3 => return InstrClass.CALL;
+		4 => return InstrClass.MEMORY;
+		5 => return InstrClass.INT_ARITH;
+		6 => return InstrClass.FLOAT_ARITH;
+		7 => return InstrClass.SIMD_ARITH;
+		8 => return InstrClass.REF;
+	}
+
+	return InstrClass.NOP;
 }
 type InstrClassEntry(op: InstrClass, static_count: u32, count: CountProbe);
 
