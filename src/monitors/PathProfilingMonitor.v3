@@ -15,20 +15,15 @@ var loop_pcs: HashMap<int, Vector<int>> = HashMap.new(int.!<int>, int.==);
 var last_is_branch = false;
 var last_if_runned = false;
 
-var current_func: FuncDecl;
+var func_stack: ArrayStack<FuncDecl> = ArrayStack.new();
 var current_path: HashMap<int, ArrayStack<Vector<PathEntry>>> = HashMap.new(int.!<int>, int.==);
 
 // Path comparator for sorting
 // - longer paths are greater
-// - paths with more occurrences are greater
 // - lexicographic order of the path entries (small to large)
 def compare(lhs: Path, rhs: Path) -> bool {
     if (lhs.entries.length != rhs.entries.length) {
         return lhs.entries.length > rhs.entries.length;
-    }
-
-    if (lhs.count != rhs.count) {
-        return lhs.count > rhs.count;
     }
 
     // lexicographic order of the path entries
@@ -88,7 +83,7 @@ class PathProfilingMonitor extends Monitor {
         Instrumentation.insertLocalProbe(mm.module, func.func_index, 0, enter_probe);
         for (bi = BytecodeIterator.new().reset(func); bi.more(); bi.next()) {
             match (bi.current()) {
-                THROW, RETHROW, THROW_REF, BR, BR_TABLE, DELEGATE => {
+                THROW, RETHROW, THROW_REF, BR, BR_IF, BR_TABLE, DELEGATE => {
                     var branch_probe = BranchProbe.new();
                     Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, branch_probe);
                 }
@@ -99,10 +94,6 @@ class PathProfilingMonitor extends Monitor {
                 ELSE => {
                     var else_probe = ElseProbe.new();
                     Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, else_probe);
-                }
-                BR_IF => {
-                    var branch_if_probe = BranchIfProbe.new();
-                    Instrumentation.insertLocalProbe(mm.module, func.func_index, bi.pc, branch_if_probe);
                 }
                 LOOP => {
                     var loop_probe = LoopProbe.new(func);
@@ -130,7 +121,7 @@ private class EnterProbe(func: FuncDecl) extends Probe {
     def fire(dynamicLoc: DynamicLoc) -> Resumption {
         last_is_branch = false;
 
-        current_func = func;
+        func_stack.push(func);
 
         if (path_table.func_index_to_paths[func.func_index] == null) {
             path_table.func_index_to_paths[func.func_index] = Vector<Path>.new();
@@ -148,6 +139,14 @@ private class EnterProbe(func: FuncDecl) extends Probe {
 
 private class LoopProbe(func: FuncDecl) extends Probe {
     def fire(dynamicLoc: DynamicLoc) -> Resumption {
+        // add current pc to path
+        var func_path = current_path[func.func_index].pop();
+        if (func_path == null) {
+            func_path = Vector<PathEntry>.new();
+        }
+        func_path.put(PathEntry(dynamicLoc.pc));
+        current_path[func.func_index].push(func_path);
+
         // end the path
         return_callback(func, dynamicLoc);
 
@@ -165,7 +164,9 @@ private class LoopProbe(func: FuncDecl) extends Probe {
 
 private class ReturnProbe(func: FuncDecl) extends Probe {
     def fire(dynamicLoc: DynamicLoc) -> Resumption {
-        return return_callback(func, dynamicLoc);
+        var ret = return_callback(func, dynamicLoc);
+        func_stack.pop();
+        return ret;
     }
 }
 
@@ -199,37 +200,19 @@ private class ElseProbe extends Probe {
     }
 }
 
-private class BranchIfProbe extends Probe {
-    def fire(dynamicLoc: DynamicLoc) -> Resumption {
-        // check the top of the stack
-        var top = dynamicLoc.frame.getFrameAccessor().getOperand(0);
-        var cond = Values.v_i(top);
-        if (cond != 0) {
-            last_is_branch = true;
-        }
-
-        return Resumption.Continue;
-    }
-}
-
 private class GlobalPathManagerProbe extends Probe {
     def fire(dynamicLoc: DynamicLoc) -> Resumption {
         if (last_is_branch) {
             last_is_branch = false;
 
-            // if this is a loop, we don't want to add the entry to the path
-            // because we are going to end it in the loop probe and start a new path
-            // there
-            var cur_pc = dynamicLoc.pc;
-            var loop_pcs = loop_pcs[current_func.func_index];
-            for (i < loop_pcs.length) {
-                var loop_pc = loop_pcs[i];
-                if (loop_pc == cur_pc) {
+            // ignore loop pc, since we are going to add the loop pc anyway
+            for (i < loop_pcs[func_stack.peek().func_index].length) {
+                if (loop_pcs[func_stack.peek().func_index][i] == dynamicLoc.pc) {
                     return Resumption.Continue;
                 }
             }
 
-            var func_index = current_func.func_index;
+            var func_index = func_stack.peek().func_index;
             var func_path = current_path[func_index].pop();
             if (func_path == null) {
                 func_path = Vector<PathEntry>.new();
