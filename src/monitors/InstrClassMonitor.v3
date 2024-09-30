@@ -64,28 +64,28 @@ enum InstrClass(ch: byte, color: string) {
 }
 def instrClassToIndex(c: InstrClass) -> int {
 	match (c) {
-		NOP => return 0;
+		CALL => return 0;
 		CONTROL => return 1;
 		DATA => return 2;
-		CALL => return 3;
-		MEMORY => return 4;
-		INT_ARITH => return 5;
-		FLOAT_ARITH => return 6;
-		SIMD_ARITH => return 7;
-		REF => return 8;
+		FLOAT_ARITH => return 3;
+		INT_ARITH => return 4;
+		MEMORY => return 5;
+		NOP => return 6;
+		REF => return 7;
+		SIMD_ARITH => return 8;
 	}
 }
 def indexToInstrClass(i: int) -> InstrClass {
 	match (i) {
-		0 => return InstrClass.NOP;
+		0 => return InstrClass.CALL;
 		1 => return InstrClass.CONTROL;
 		2 => return InstrClass.DATA;
-		3 => return InstrClass.CALL;
-		4 => return InstrClass.MEMORY;
-		5 => return InstrClass.INT_ARITH;
-		6 => return InstrClass.FLOAT_ARITH;
-		7 => return InstrClass.SIMD_ARITH;
-		8 => return InstrClass.REF;
+		3 => return InstrClass.FLOAT_ARITH;
+		4 => return InstrClass.INT_ARITH;
+		5 => return InstrClass.MEMORY;
+		6 => return InstrClass.NOP;
+		7 => return InstrClass.REF;
+		8 => return InstrClass.SIMD_ARITH;
 	}
 
 	return InstrClass.NOP;
@@ -95,6 +95,11 @@ type InstrClassEntry(op: InstrClass, static_count: u32, count: CountProbe);
 def compare(a: InstrClassEntry, b: InstrClassEntry) -> bool {
 	if (a.count == null) return false;
 	if (b.count == null) return true;
+
+	if (a.count.count == b.count.count) {
+		return instrClassToIndex(a.op) < instrClassToIndex(b.op);
+	}
+
 	return a.count.count > b.count.count;
 }
 
